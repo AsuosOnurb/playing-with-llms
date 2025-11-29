@@ -1,5 +1,5 @@
 [project]
-name = "agents-playground"
+name = "pwllms"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -10,4 +10,17 @@ dependencies = [
     "langgraph>=1.0.4",
     "openai>=2.8.1",
     "requests>=2.32.5",
+    "rich>=14.2.0",
 ]
+
+
+[project.scripts]
+# Degine the entry points for the application
+app = "pwllms.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pwllms"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

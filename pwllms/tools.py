@@ -1,36 +1,12 @@
+# tools.py
+
 import os
-from typing import List, Optional, TypedDict
+from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.graph import END, StateGraph
-
-# ---------- STATE ----------
-
-
-class AgentState(TypedDict):
-    # Use LangChain message objects directly, not dicts
-    messages: List[BaseMessage]
-
-
-# ---------- LLM ----------
-
-llm = ChatOpenAI(
-    model="llama3.2:3b",
-    base_url="http://localhost:11434/v1",
-    api_key="ollama",  # dummy, required by client
-    temperature=0,
-)
-
 
 # ---------- TOOLS ----------
 
@@ -245,7 +221,15 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"ERROR: web_search failed for query '{query}': {e}"
 
 
-tools = [
+llm = ChatOpenAI(
+    model="llama3.2:3b",
+    base_url="http://localhost:11434/v1",
+    api_key="ollama",  # dummy, required by client
+    temperature=0,
+)
+
+
+AVAILABLE_TOOLS = [
     calculate,
     list_files,
     read_text_file,
@@ -254,190 +238,5 @@ tools = [
     fetch_url,
     web_search,
 ]
-llm_with_tools = llm.bind_tools(tools)
 
-
-# ---------- NODES ----------
-
-
-def agent_node(state: AgentState) -> AgentState:
-    """
-    Run the main agent LLM. It can decide to call tools or answer directly.
-    """
-    messages = state["messages"]
-    response: AIMessage = llm_with_tools.invoke(messages)
-    # Append the AIMessage directly
-    return {"messages": messages + [response]}
-
-
-def tool_node(state: AgentState) -> AgentState:
-    """
-    Execute any tool calls requested by the last assistant message.
-    """
-    messages = state["messages"]
-    if not messages:
-        return state
-
-    last = messages[-1]
-
-    # The last message must be an AIMessage with tool_calls
-    if not isinstance(last, AIMessage):
-        return state
-
-    tool_calls = last.tool_calls or []
-    if not tool_calls:
-        return state
-
-    new_messages: List[BaseMessage] = messages.copy()
-
-    for tc in tool_calls:
-        # For ChatOpenAI tool calls, tc is dict-like: {"name", "args", "id"}
-        tool_name = tc["name"]
-        # Make a mutable copy of args so we can sanitize
-        args = dict(tc["args"])
-        call_id = tc["id"]
-
-        # --- SANITIZE ARGS FOR KNOWN TOOLS ---
-        if tool_name in ("fetch_url", "read_text_file"):
-            # Ollama sometimes sends "null" (string) or None for max_chars.
-            if "max_chars" in args and args["max_chars"] in (None, "null", ""):
-                # Remove it so Pydantic uses the default from the function signature.
-                args.pop("max_chars")
-
-        if tool_name == "web_search":
-            if "max_results" in args and args["max_results"] in (None, "null", ""):
-                args.pop("max_results")
-
-        matching_tool = next((t for t in tools if t.name == tool_name), None)
-        if not matching_tool:
-            new_messages.append(
-                ToolMessage(
-                    content=f"Tool {tool_name} not found.",
-                    tool_call_id=call_id,
-                )
-            )
-            continue
-
-        result = matching_tool.invoke(args)
-
-        # Add the ToolMessage so the LLM can see the tool output next step
-        new_messages.append(
-            ToolMessage(
-                content=str(result),
-                tool_call_id=call_id,
-            )
-        )
-
-    return {"messages": new_messages}
-
-
-# ---------- ROUTER ----------
-
-
-def _should_continue(state: AgentState):
-    """
-    Decide whether to continue to tools or end.
-
-    If the last assistant message has tool_calls, go to tools; else, end.
-    """
-    messages = state["messages"]
-    if not messages:
-        return END
-
-    last = messages[-1]
-    if isinstance(last, AIMessage) and last.tool_calls:
-        return "tools"
-    return END
-
-
-# ---------- GRAPH ----------
-
-
-def build_graph():
-    workflow = StateGraph(AgentState)
-
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", tool_node)
-
-    workflow.set_entry_point("agent")
-
-    workflow.add_conditional_edges(
-        "agent",
-        _should_continue,
-        {
-            "tools": "tools",
-            END: END,
-        },
-    )
-    workflow.add_edge("tools", "agent")
-
-    return workflow.compile()
-
-
-# ---------- CLI ----------
-
-if __name__ == "__main__":
-    graph = build_graph()
-    print("LangGraph agent with intenet search. Type 'exit' to quit.\n")
-
-    system_prompt = (
-        "You are a helpful local agent.\n"
-        "You have access to tools: calculate, list_files, read_text_file, "
-        "write_text_file, search_text_in_file, fetch_url, web_search.\n"
-        "Use tools instead of guessing when you need to do math, inspect directories, "
-        "read/write/search local files, read the contents of a web page, or search the web.\n"
-        "Use web_search when the user asks you to look something up on the internet or "
-        "wants up-to-date information; then, if needed, call fetch_url on one of the "
-        "returned URLs for more detail.\n"
-        "When you use tools, always tell the user clearly what you did and summarize results."
-    )
-
-    state: AgentState = {"messages": [SystemMessage(content=system_prompt)]}
-
-    while True:
-        user = input("You: ")
-        if user.strip().lower() in {"exit", "quit"}:
-            break
-
-        # Track how many messages we had before this turn
-        prev_len = len(state["messages"])
-
-        # Append new user message to existing convo
-        state["messages"].append(HumanMessage(content=user))
-
-        # Run the graph
-        state = graph.invoke(state)
-
-        # Get only the new messages created this turn
-        new_messages = state["messages"][prev_len:]
-
-        # Show tool activity (optional but nice for debugging)
-        for m in new_messages:
-            if isinstance(m, ToolMessage):
-                full = m.content or ""
-
-                # Build a preview using first N non-empty lines
-                lines = [ln.strip() for ln in full.splitlines() if ln.strip()]
-                max_lines = 8
-
-                if not lines:
-                    preview = "(empty tool output)"
-                else:
-                    preview_lines = lines[:max_lines]
-                    preview = "\n".join(preview_lines)
-                    if len(lines) > max_lines:
-                        preview += f"\n... ({len(lines) - max_lines} more lines, truncated in CLI)"
-
-                print(f"[TOOL] {m.tool_call_id}:\n{preview}\n")
-
-        # Find last ai message
-        last_ai = None
-        for m in reversed(state["messages"]):
-            if isinstance(m, AIMessage):
-                last_ai = m
-                break
-
-        if last_ai is None:
-            print("Agent: (no answer)\n")
-        else:
-            print(f"Agent: {last_ai.content}\n")
+LLM_WITH_TOOLS = llm.bind_tools(AVAILABLE_TOOLS)
