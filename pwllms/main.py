@@ -19,7 +19,7 @@ from rich.tree import Tree
 
 from pwllms.agent import AgentState
 from pwllms.executor import executor_node
-from pwllms.graph import build_graph, build_planner_graph
+from pwllms.graph import build_graph, build_planner_graph, should_use_planner
 from pwllms.planner import create_planner_node
 
 
@@ -81,7 +81,7 @@ def main():
     )
 
     system_prompt = (
-        "You are a helpful local agent.\n"
+        "You are an agent, much like Jarvis from Iron Man.\n"
         "You have access to tools: calculate, list_files, read_text_file, "
         "write_text_file, search_text_in_file, fetch_url, web_search.\n"
         "Only call tools when the user explicitly asks you to perform an action that "
@@ -261,6 +261,48 @@ def main():
 
             continue
 
+        # ---- AUTO PLANNER INSIDE NORMAL CHAT ----
+        if should_use_planner(user):
+            # Build a fresh planner state for this request
+            planner_state: AgentState = {
+                "messages": [
+                    SystemMessage(content="You are a planning agent."),
+                    HumanMessage(content=user),
+                ],
+                "plan": [],
+                "executing_plan": False,
+            }
+
+            final_state = planner_graph.invoke(planner_state)
+
+            # Extract final AI answer from planner+executor
+            last_ai = None
+            for m in reversed(final_state["messages"]):
+                if isinstance(m, AIMessage):
+                    last_ai = m
+                    break
+
+            if last_ai is None or not str(getattr(last_ai, "content", "")).strip():
+                console.print(
+                    Panel("Agent (planner): (no answer)", style="red", box=box.ROUNDED)
+                )
+            else:
+                console.print(
+                    Panel(
+                        last_ai.content,
+                        title="Agent (planner)",
+                        style="bold blue",
+                        box=box.ROUNDED,
+                    )
+                )
+
+            # OPTIONAL: also append this interaction into main chat history
+            chat_state["messages"].append(HumanMessage(content=user))
+            if last_ai is not None:
+                chat_state["messages"].append(last_ai)
+
+            continue
+
         # ---- NORMAL CHAT MODE ----
         prev_len = len(chat_state["messages"])
         chat_state["messages"].append(HumanMessage(content=user))
@@ -333,7 +375,7 @@ def main():
                 last_ai = m
                 break
 
-        if last_ai is None:
+        if last_ai is None or not str(getattr(last_ai, "content", "")).strip():
             console.print(Panel("Agent: (no answer)", style="red", box=box.ROUNDED))
         else:
             console.print(

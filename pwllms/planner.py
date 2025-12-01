@@ -102,6 +102,34 @@ def create_planner_node(state: AgentState) -> AgentState:
             ],
         }
 
+    # Filter out invalid tool steps
+    valid_tool_names = {
+        t.name for t in __import__("pwllms.tools").tools.AVAILABLE_TOOLS
+    }
+
+    def filter_steps(steps):
+        filtered = []
+        for step in steps:
+            if (
+                step.get("kind") == "tool"
+                and step.get("tool_name") not in valid_tool_names
+            ):
+                # Replace with a note so the user sees what was skipped
+                filtered.append(
+                    {
+                        "id": step.get("id", "?"),
+                        "kind": "note",
+                        "description": f"Skipped invalid tool: {step.get('tool_name')}",
+                    }
+                )
+                continue
+            if step.get("kind") == "subplan":
+                step["substeps"] = filter_steps(step.get("substeps", []))
+            filtered.append(step)
+        return filtered
+
+    plan["steps"] = filter_steps(plan.get("steps", []))
+
     new_state = dict(state)
     new_state["plan"] = plan.get("steps", [])
     new_state["executing_plan"] = True
